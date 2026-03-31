@@ -196,7 +196,7 @@ type Ethereum struct {
 
 	waitForStageLoopStop chan struct{}
 
-	txPoolProvider           *txpoolcomp.Provider
+	txPoolProvider            *txpoolcomp.Provider
 	txPool                    *txpool.TxPool
 	txPoolGrpcServer          txpoolproto.TxpoolServer
 	txPoolRpcClient           txpoolproto.TxpoolClient
