@@ -91,6 +91,7 @@ import (
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/node"
+	txpoolcomp "github.com/erigontech/erigon/node/components/txpool"
 	"github.com/erigontech/erigon/node/direct"
 	"github.com/erigontech/erigon/node/ethconfig"
 	"github.com/erigontech/erigon/node/ethstats"
@@ -195,6 +196,7 @@ type Ethereum struct {
 
 	waitForStageLoopStop chan struct{}
 
+	txPoolProvider           *txpoolcomp.Provider
 	txPool                    *txpool.TxPool
 	txPoolGrpcServer          txpoolproto.TxpoolServer
 	txPoolRpcClient           txpoolproto.TxpoolClient
@@ -694,31 +696,42 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 
 	backend.stateDiffClient = direct.NewStateDiffClientDirect(kvRPC)
 	var txnProvider txnprovider.TxnProvider
-	if config.TxPool.Disable {
-		backend.txPoolGrpcServer = &txpool.GrpcDisabled{}
-	} else {
-		sentries := backend.sentriesClient.Sentries()
-		blockBuilderNotifyNewTxns := func() {
-			select {
-			case backend.blockBuilderNotifyNewTxns <- struct{}{}:
-			default:
-			}
-		}
-		backend.txPool, backend.txPoolGrpcServer, err = txpool.Assemble(
-			ctx,
-			config.TxPool,
-			backend.chainDB,
-			kvcache.NewDummy(),
-			sentries,
-			backend.stateDiffClient,
-			blockBuilderNotifyNewTxns,
-			logger,
-			direct.NewEthBackendClientDirect(backend.ethBackendRPC),
-		)
-		if err != nil {
-			return nil, err
-		}
 
+	// Create and configure txpool component
+	txPoolProvider := txpoolcomp.NewProvider()
+	if err := txPoolProvider.Configure(
+		config.TxPool,
+		backend.chainDB,
+		backend.chainConfig,
+		direct.NewEthBackendClientDirect(backend.ethBackendRPC),
+		backend.stateDiffClient,
+		logger,
+	); err != nil {
+		return nil, err
+	}
+	if err := txPoolProvider.SetSentryClients(sentries); err != nil {
+		return nil, err
+	}
+	if err := txPoolProvider.SetCache(kvcache.NewDummy()); err != nil {
+		return nil, err
+	}
+	if err := txPoolProvider.SetBuilderNotifyNewTxns(func() {
+		select {
+		case backend.blockBuilderNotifyNewTxns <- struct{}{}:
+		default:
+		}
+	}); err != nil {
+		return nil, err
+	}
+
+	if err := txPoolProvider.Initialize(ctx); err != nil {
+		return nil, err
+	}
+
+	backend.txPoolProvider = txPoolProvider
+	backend.txPool = txPoolProvider.Pool
+	backend.txPoolGrpcServer = txPoolProvider.Server
+	if !txPoolProvider.IsDisabled() {
 		txnProvider = backend.txPool
 	}
 
@@ -1495,19 +1508,10 @@ func (s *Ethereum) Start() error {
 		go stageloop.StageLoop(s.sentryCtx, s.chainDB, s.stagedSync, s.sentriesClient.Hd, s.waitForStageLoopStop, s.config.Sync.LoopThrottle, s.logger, s.blockReader, hook)
 	}
 
-	if s.txPool != nil {
-		// We start the transaction pool on startup, for a couple of reasons:
-		// 1) Hive tests requires us to do so and starting it from eth_sendRawTransaction is not viable as we have not enough data
-		// to initialize it properly.
-		// 2) we cannot propose for block 1 regardless.
-		s.bgComponentsEg.Go(func() error {
-			defer s.logger.Info("[devp2p] txn pool goroutine terminated")
-			err := s.txPool.Run(s.sentryCtx)
-			if err != nil && !errors.Is(err, context.Canceled) {
-				s.logger.Error("[devp2p] Run error", "err", err)
-			}
+	if s.txPoolProvider != nil {
+		if err := s.txPoolProvider.Activate(); err != nil {
 			return err
-		})
+		}
 	}
 
 	if s.shutterPool != nil {
@@ -1529,6 +1533,11 @@ func (s *Ethereum) Start() error {
 func (s *Ethereum) Stop() error {
 	// Stop all the peer-related stuff first.
 	s.sentryCancel()
+	if s.txPoolProvider != nil {
+		if err := s.txPoolProvider.Deactivate(); err != nil {
+			s.logger.Error("txpool deactivate failed", "err", err)
+		}
+	}
 	if s.unsubscribeEthstat != nil {
 		s.unsubscribeEthstat()
 	}
